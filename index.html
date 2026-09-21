@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>NB-Designer Text Library Exporter</title>
+  <style>
+    /* --- CẤU HÌNH KÉO DI CHUYỂN CỬA SỔ (DRAG) --- */
+    body { 
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+      padding: 10px; 
+      background-color: #f8f9fa; 
+      margin: 0; 
+      transition: all 0.2s;
+      /* Cho phép giữ chuột và kéo cửa sổ di chuyển khắp màn hình */
+      -webkit-app-region: drag;
+    }
+
+    /* Vùng tương tác (nút bấm, ô nhập, bảng) phải loại bỏ drag để gõ chữ và click được */
+    input, button, table, .table-container { 
+      -webkit-app-region: no-drag; 
+    }
+
+    /* --- GIAO DIỆN CHÍNH --- */
+    h2 { margin-top: 0; color: #343a40; font-size: 18px; margin-bottom: 8px; }
+    .toolbar { margin-bottom: 8px; display: flex; gap: 8px; align-items: center; }
+    
+    button { 
+      padding: 5px 12px; 
+      border: none; 
+      border-radius: 4px; 
+      cursor: pointer; 
+      font-weight: 600; 
+      font-size: 13px; 
+    }
+    .btn-add { background-color: #0d6efd; color: white; }
+    .btn-col { background-color: #0dcaf0; color: #212529; }
+    .btn-compact { background-color: #6f42c1; color: white; }
+    .btn-export { background-color: #198754; color: white; margin-left: auto; }
+    .btn-import { background-color: #fd7e14; color: white; }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    
+    .table-container { 
+      overflow-x: auto; 
+      background: white; 
+      border-radius: 6px; 
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08); 
+      max-height: 80vh; 
+    }
+    table { width: 100%; border-collapse: collapse; min-width: 600px; }
+    th, td { border: 1px solid #dee2e6; padding: 4px 6px; text-align: left; vertical-align: top; }
+    th { background-color: #e9ecef; color: #495057; font-size: 12px; }
+    input { width: 90%; padding: 4px 6px; border: 1px solid #ced4da; border-radius: 4px; font-size: 13px; }
+    .btn-del { background-color: #dc3545; color: white; padding: 2px 6px; font-size: 11px; }
+    tr.group-start td { border-top: 2px solid #adb5bd; }
+
+    /* --- CHẾ ĐỘ SIÊU THU NHỎ (COMPACT MODE) --- */
+    body.compact-mode { padding: 4px; background-color: #fff; }
+    body.compact-mode h2 { display: none; }
+    body.compact-mode .btn-add,
+    body.compact-mode .btn-col { display: none; }
+    body.compact-mode .toolbar { margin-bottom: 4px; justify-content: flex-end; }
+    body.compact-mode .btn-import,
+    body.compact-mode .btn-export { padding: 2px 8px; font-size: 11px; }
+    body.compact-mode .btn-compact { padding: 2px 8px; font-size: 11px; background-color: #fd7e14; }
+    body.compact-mode .table-container { max-height: calc(100vh - 30px); box-shadow: none; border: 1px solid #ccc; }
+  </style>
+</head>
+<body>
+
+  <h2>Quản Lý Nhập Liệu Text Library</h2>
+  
+  <div class="toolbar">
+    <button class="btn-add" onclick="addRow()">+ Thêm dòng</button>
+    <button class="btn-col" onclick="addLanguageColumn()">+ Thêm ngôn ngữ</button>
+    <button class="btn-compact" id="compactBtn" onclick="toggleCompact()">📌 Thu nhỏ Mini</button>
+    <button class="btn-import" id="importBtn" onclick="importToNB()">⚡ Import vào NB-Designer</button>
+    <button class="btn-export" onclick="exportExcel()">Export (.csv)</button>
+  </div>
+
+  <div class="table-container">
+    <table id="dataTable">
+      <thead>
+        <tr id="headerRow">
+          <th style="width: 35px;">STT</th>
+          <th>Name</th>
+          <th style="width: 65px;">Status</th>
+          <th>Language1</th>
+          <th>Language2</th>
+          <th style="width: 45px;">Xóa</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
