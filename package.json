@@ -1,11 +1,12 @@
 {
   "name": "nb-textlib-exporter",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder",
-    "build:publish": "electron-builder --publish always",
+    "build:helper": "py -3 -m PyInstaller --onefile --noconsole --distpath dist-py --workpath build-py --specpath build-py auto_import.py",
+    "build": "npm run build:helper && electron-builder",
+    "build:publish": "npm run build:helper && electron-builder --publish always",
     "deploy": "git add -A && git commit -m \"update\" && npm run build && git push",
     "release:auto": "node scripts/release.js"
   },
@@ -30,6 +31,12 @@
       "auto_import.py",
       "inspect_textlib.py",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist-py/auto_import.exe",
+        "to": "auto_import.exe"
+      }
     ],
     "win": {
       "target": "nsis"

@@ -1,5 +1,9 @@
 node_modules/
 dist/
+dist-py/
+build-py/
+__pycache__/
+*.py[cod]
 TextLib_temp.csv
 .venv/
 .vscode/

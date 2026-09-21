@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 
 let win;
 let cachedPythonCmd = null;
@@ -112,22 +112,100 @@ ipcMain.on('export-excel', async (event, { rows, langCount }) => {
 });
 
 // 3. TỰ ĐỘNG IMPORT NGẦM VÀO NB-DESIGNER (Tạo file tạm -> Import -> Xóa file)
+//
+// auto_import.py/.exe giờ thao tác thẳng vào ĐÚNG control của NB-Designer (nút Import, ô nhập
+// đường dẫn, nút Open...) đã dò được thật trên máy, có chờ/xác minh từng bước, thay vì gửi phím
+// mù cố định như bản trước. Kết quả trả về DUY NHẤT 1 dòng JSON trên stdout (mọi log tiến trình
+// khác đi ra stderr), nên phía Electron chỉ cần JSON.parse(stdout) là biết chắc thành công/thất
+// bại và lấy đúng thông báo hiển thị cho người dùng.
+//
+// Dùng spawn() thay vì exec(): không qua shell nên không cần lo escape đường dẫn có dấu cách/ký
+// tự đặc biệt, và tách rõ luồng stdout/stderr thay vì gộp chung.
+function runImportHelper(command, args, tempFilePath, event) {
+  const cleanupTemp = () => {
+    if (fs.existsSync(tempFilePath)) {
+      try { fs.unlinkSync(tempFilePath); } catch (e) {}
+    }
+  };
+
+  let child;
+  try {
+    child = spawn(command, args, { windowsHide: true });
+  } catch (err) {
+    cleanupTemp();
+    event.reply('import-result', { success: false, message: 'Không chạy được chương trình Import: ' + err.message });
+    return;
+  }
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d.toString(); });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+  child.on('error', (err) => {
+    cleanupTemp();
+    event.reply('import-result', { success: false, message: 'Không chạy được chương trình Import: ' + err.message });
+  });
+
+  child.on('close', (code) => {
+    // CHỈ xóa file tạm SAU KHI tiến trình con đã đóng - lúc này auto_import đã tự xác minh xong
+    // dialog chọn file đã đóng (xem _wait_until_gone trong auto_import.py), nên không còn race
+    // condition kiểu xóa file trước khi NB-Designer kịp đọc như bản cũ.
+    cleanupTemp();
+
+    let result = null;
+    try {
+      result = JSON.parse(stdout.trim());
+    } catch (e) {
+      // Không parse được JSON - script có thể đã crash trước khi in được kết quả. Gộp mọi log lại
+      // để còn chẩn đoán được, thay vì chỉ báo chung chung "Command failed".
+      const details = [
+        stderr && stderr.trim(),
+        stdout && stdout.trim(),
+        `Mã thoát: ${code}`,
+      ].filter(Boolean).join('\n');
+      event.reply('import-result', { success: false, message: 'Lỗi Import NB-Designer (không đọc được kết quả):\n' + details });
+      return;
+    }
+
+    event.reply('import-result', {
+      success: !!result.success,
+      message: result.message || (result.success ? 'Import thành công!' : 'Import thất bại.'),
+    });
+  });
+}
+
 ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
   // QUAN TRỌNG: không dùng path.join(__dirname, ...) cho file TẠO MỚI/GHI ĐÈ, vì sau khi đóng
   // gói (.exe), __dirname trỏ vào bên trong app.asar - một file nén CHỈ ĐỌC, không phải thư mục
   // thật, nên fs.writeFileSync sẽ báo lỗi ENOENT ("not found in ...app.asar"). Dùng thư mục Temp
   // của hệ điều hành (luôn có quyền ghi, bất kể cài app ở đâu) để tạo file tạm an toàn hơn.
-  const tempFilePath = path.join(os.tmpdir(), 'TextLib_temp.csv');
+  //
+  // Tên file có timestamp + hậu tố ngẫu nhiên (thay vì tên cố định "TextLib_temp.csv") để 2 lần
+  // bấm Import liên tiếp, hoặc 2 instance app chạy cùng lúc, không ghi đè/xóa nhầm file của nhau.
+  const uniqueSuffix = `${Date.now()}_${Math.random().toString(16).slice(2, 6)}`;
+  const tempFilePath = path.join(os.tmpdir(), `NBTextLib_${uniqueSuffix}.csv`);
 
   try {
     // Tạo file CSV tạm chuẩn định dạng
     createNBTextLibCSV(tempFilePath, rows, langCount);
 
-    // Lưu ý: scriptPath vẫn dùng __dirname là ĐÚNG (chỉ để ĐỌC, không ghi), NHƯNG chỉ hoạt động
-    // được khi đã tắt asar (xem "build.asar": false trong package.json). Nếu bật asar,
-    // auto_import.py sẽ nằm bên trong app.asar và Python (chương trình ngoài Electron) sẽ
-    // KHÔNG đọc được file này, dù fs.existsSync() bên dưới vẫn trả về true (do Electron tự vá
-    // fs để đọc được asar, nhưng exec() gọi Python thì không).
+    if (app.isPackaged) {
+      // Bản đã đóng gói: gọi thẳng auto_import.exe đi kèm bộ cài (nằm ngoài app.asar, trong thư
+      // mục resources/ - xem "extraResources" trong package.json). Không cần dò Python trên máy
+      // người dùng cuối nữa - họ không cần cài gì thêm.
+      const helperPath = path.join(process.resourcesPath, 'auto_import.exe');
+      if (!fs.existsSync(helperPath)) {
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        event.reply('import-result', { success: false, message: 'Không tìm thấy auto_import.exe đi kèm bản cài đặt!' });
+        return;
+      }
+      runImportHelper(helperPath, [tempFilePath], tempFilePath, event);
+      return;
+    }
+
+    // Bản dev (chạy bằng "npm start", chưa đóng gói): vẫn dùng script Python trực tiếp như cũ,
+    // để không cần build lại auto_import.exe mỗi lần sửa auto_import.py khi đang phát triển.
     const scriptPath = path.join(__dirname, 'auto_import.py');
 
     if (!fs.existsSync(scriptPath)) {
@@ -136,15 +214,9 @@ ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
       return;
     }
 
-    const cleanupTemp = () => {
-      if (fs.existsSync(tempFilePath)) {
-        try { fs.unlinkSync(tempFilePath); } catch (e) {}
-      }
-    };
-
     findPythonCmd((pythonCmd) => {
       if (!pythonCmd) {
-        cleanupTemp();
+        if (fs.existsSync(tempFilePath)) { try { fs.unlinkSync(tempFilePath); } catch (e) {} }
         event.reply('import-result', {
           success: false,
           message:
@@ -157,27 +229,10 @@ ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
         return;
       }
 
-      // Chạy Python Script để tự động gửi phím tắt Import vào NB-Designer
-      exec(`${pythonCmd} "${scriptPath}" "${tempFilePath}"`, { windowsHide: true }, (error, stdout, stderr) => {
-        // Dọn dẹp/Tự động xóa file tạm ngay sau khi thực thi xong
-        cleanupTemp();
-
-        if (error) {
-          // Gộp mọi nguồn thông tin có thể có để dễ chẩn đoán, tránh trường hợp chỉ hiện
-          // "Command failed: ..." mà không rõ nguyên nhân thật sự.
-          const details = [
-            stderr && stderr.trim(),
-            stdout && stdout.trim(),
-            `Mã lỗi thoát: ${error.code}`,
-            error.message,
-          ].filter(Boolean).join('\n');
-
-          event.reply('import-result', { success: false, message: 'Lỗi Import NB-Designer:\n' + details });
-          return;
-        }
-
-        event.reply('import-result', { success: true, message: 'Đã tự động Import vào NB-Designer thành công!' });
-      });
+      // pythonCmd có thể là "py -3" (2 từ) - tách command khỏi tham số vì spawn() không qua shell
+      // nên không tự tách chuỗi lệnh như exec() làm.
+      const [cmd, ...baseArgs] = pythonCmd.split(' ');
+      runImportHelper(cmd, [...baseArgs, scriptPath, tempFilePath], tempFilePath, event);
     });
 
   } catch (err) {
