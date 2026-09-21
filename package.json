@@ -19,6 +19,7 @@
   "build": {
     "appId": "com.nbtextlib.exporter",
     "productName": "NB TextLib Exporter",
+    "asar": false,
     "publish": {
       "provider": "github"
     },

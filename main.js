@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { exec } = require('child_process');
 
 let win;
@@ -112,12 +113,21 @@ ipcMain.on('export-excel', async (event, { rows, langCount }) => {
 
 // 3. TỰ ĐỘNG IMPORT NGẦM VÀO NB-DESIGNER (Tạo file tạm -> Import -> Xóa file)
 ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
-  const tempFilePath = path.join(__dirname, 'TextLib_temp.csv');
+  // QUAN TRỌNG: không dùng path.join(__dirname, ...) cho file TẠO MỚI/GHI ĐÈ, vì sau khi đóng
+  // gói (.exe), __dirname trỏ vào bên trong app.asar - một file nén CHỈ ĐỌC, không phải thư mục
+  // thật, nên fs.writeFileSync sẽ báo lỗi ENOENT ("not found in ...app.asar"). Dùng thư mục Temp
+  // của hệ điều hành (luôn có quyền ghi, bất kể cài app ở đâu) để tạo file tạm an toàn hơn.
+  const tempFilePath = path.join(os.tmpdir(), 'TextLib_temp.csv');
 
   try {
     // Tạo file CSV tạm chuẩn định dạng
     createNBTextLibCSV(tempFilePath, rows, langCount);
 
+    // Lưu ý: scriptPath vẫn dùng __dirname là ĐÚNG (chỉ để ĐỌC, không ghi), NHƯNG chỉ hoạt động
+    // được khi đã tắt asar (xem "build.asar": false trong package.json). Nếu bật asar,
+    // auto_import.py sẽ nằm bên trong app.asar và Python (chương trình ngoài Electron) sẽ
+    // KHÔNG đọc được file này, dù fs.existsSync() bên dưới vẫn trả về true (do Electron tự vá
+    // fs để đọc được asar, nhưng exec() gọi Python thì không).
     const scriptPath = path.join(__dirname, 'auto_import.py');
 
     if (!fs.existsSync(scriptPath)) {
