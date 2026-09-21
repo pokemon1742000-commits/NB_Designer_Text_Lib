@@ -39,7 +39,6 @@ import subprocess
 import ctypes
 from ctypes import wintypes
 from pywinauto import Application, Desktop
-from pywinauto.keyboard import send_keys
 
 # Console Windows mặc định dùng bảng mã cp1252, không in được tiếng Việt có dấu -> ép stdout/stderr
 # sang UTF-8 (kèm errors='replace' để không bao giờ crash chỉ vì in log).
@@ -188,18 +187,23 @@ def _connect_main_window():
                     access_denied_pids.append(pid)
                 continue
 
-            hwnds = _enum_visible_windows_for_pid(pid)
-            if not hwnds:
+            hwnds = _enum_windows_for_pid(pid)
+            candidates = [
+                item for item in hwnds
+                if (
+                    item["class_name"] != "#32770"
+                    and item["title"].strip()
+                    and item["area"] > 0
+                )
+            ]
+            if not candidates:
                 no_window_pids.append(pid)
                 continue
 
-            for hwnd in hwnds:
-                rect = wintypes.RECT()
-                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                area = (rect.right - rect.left) * (rect.bottom - rect.top)
-                if area > chosen_area:
-                    chosen_area = area
-                    chosen_hwnd = hwnd
+            for item in candidates:
+                if item["area"] > chosen_area:
+                    chosen_area = item["area"]
+                    chosen_hwnd = item["hwnd"]
                     chosen_pid = pid
 
         if chosen_hwnd is None:
@@ -231,22 +235,179 @@ def _connect_main_window():
         return pid, win
 
 
-def _force_foreground(hwnd):
-    """Ép cửa sổ hwnd lên foreground bằng Win32 API trực tiếp (set_focus() của pywinauto đôi khi
-    không hiệu quả với dialog không tự "xin" OS focus)."""
+def _window_belongs_to_pid(hwnd, pid):
+    return bool(hwnd) and ctypes.windll.user32.IsWindow(hwnd) and _pid_of_hwnd(hwnd) == pid
+
+
+def _force_set_foreground(hwnd):
+    """Đưa hwnd lên foreground kể cả khi bị Windows "foreground lock" chặn.
+
+    Windows mặc định KHÔNG cho một tiến trình nền (không vừa nhận input từ người
+    dùng) tự ý cướp foreground bằng SetForegroundWindow() thẳng - lời gọi âm thầm
+    thất bại (chỉ nháy icon taskbar). Đây là nguyên nhân thật sự khiến helper
+    tưởng đã đưa NB-Designer lên trước nhưng thực ra cửa sổ vẫn ở dưới/mất focus.
+    Dùng kỹ thuật chuẩn: gắn tạm input queue của luồng đang giữ foreground (và của
+    luồng sở hữu hwnd) vào luồng hiện tại để được Windows cho phép đổi foreground,
+    rồi gỡ ra ngay sau đó.
+    """
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    foreground_hwnd = user32.GetForegroundWindow()
+    if foreground_hwnd == hwnd:
+        return bool(user32.SetForegroundWindow(hwnd))
+
+    current_thread_id = kernel32.GetCurrentThreadId()
+    target_thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+    foreground_thread_id = (
+        user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+    )
+
+    attached_fg = False
+    attached_target = False
+    try:
+        if foreground_thread_id and foreground_thread_id != current_thread_id:
+            attached_fg = bool(
+                user32.AttachThreadInput(current_thread_id, foreground_thread_id, True)
+            )
+        if target_thread_id and target_thread_id != current_thread_id:
+            attached_target = bool(
+                user32.AttachThreadInput(current_thread_id, target_thread_id, True)
+            )
+
+        user32.BringWindowToTop(hwnd)
+        result = bool(user32.SetForegroundWindow(hwnd))
+    finally:
+        if attached_fg:
+            user32.AttachThreadInput(current_thread_id, foreground_thread_id, False)
+        if attached_target:
+            user32.AttachThreadInput(current_thread_id, target_thread_id, False)
+
+    return result
+
+
+def _enum_windows_for_pid(pid):
+    """Liệt kê mọi cửa sổ top-level của PID, kể cả cửa sổ đang bị ẩn/minimize."""
+    results = []
+
+    def _cb(hwnd, _lparam):
+        if _pid_of_hwnd(hwnd) != pid:
+            return True
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        cls = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, cls, 256)
+        title_len = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        title = ctypes.create_unicode_buffer(title_len + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, title, title_len + 1)
+        area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+        results.append({
+            "hwnd": hwnd,
+            "visible": bool(ctypes.windll.user32.IsWindowVisible(hwnd)),
+            "minimized": bool(ctypes.windll.user32.IsIconic(hwnd)),
+            "class_name": cls.value,
+            "title": title.value,
+            "area": area,
+        })
+        return True
+
+    ctypes.windll.user32.EnumWindows(_EnumWindowsProc(_cb), 0)
+    return results
+
+
+def _find_restoreable_main_hwnd(pid, preferred_hwnd=None):
+    if _window_belongs_to_pid(preferred_hwnd, pid):
+        return preferred_hwnd
+
+    candidates = [
+        item for item in _enum_windows_for_pid(pid)
+        if (
+            item["class_name"] != "#32770"
+            and item["title"].strip()
+            and item["area"] > 0
+        )
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item["area"], reverse=True)
+    return candidates[0]["hwnd"]
+
+
+def _restore_main_window(pid, preferred_hwnd=None, retries=4):
+    """Khôi phục cửa sổ chính về trạng thái hiển thị mà không minimize/đóng nó."""
+    SW_RESTORE = 9
     SW_SHOW = 5
-    try:
-        ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.BringWindowToTop(hwnd)
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
+    hwnd = _find_restoreable_main_hwnd(pid, preferred_hwnd)
+    if not hwnd:
+        return None
+
+    user32 = ctypes.windll.user32
+    for _ in range(retries):
+        try:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            elif not user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, SW_SHOW)
+            _force_set_foreground(hwnd)
+            if user32.IsIconic(hwnd):
+                # SetForegroundWindow đôi khi tự restore cửa sổ, nhưng nếu vẫn còn
+                # minimize thì gọi lại SW_RESTORE một lần nữa cho chắc.
+                user32.ShowWindow(hwnd, SW_RESTORE)
+        except Exception:
+            pass
+
+        # LƯU Ý QUAN TRỌNG: IsWindowVisible() vẫn trả về True cho cửa sổ đang bị
+        # minimize (nó chỉ kiểm tra style WS_VISIBLE, không quan tâm trạng thái
+        # iconic) - đây chính là lỗi khiến bản trước tưởng đã khôi phục xong nhưng
+        # NB-Designer trên thực tế vẫn đang minimize/mất hình. Phải kiểm tra thêm
+        # "not IsIconic()" mới coi là khôi phục thành công.
+        if user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            return hwnd
+        time.sleep(0.15)
+    return None
+
+
+def _force_foreground(hwnd, pid=None):
+    """Đưa cửa sổ lên foreground, luôn restore nếu đang minimized/ẩn."""
+    if pid is None:
+        pid = _pid_of_hwnd(hwnd)
+    return _restore_main_window(pid, hwnd)
+
+
+def _open_text_library_via_keys(hwnd, pid):
+    """Gửi tổ hợp phím tắt Alt+O -> T để mở Text Library.
+
+    NB-Designer dùng toolbar/ribbon tự vẽ (GetMenu() trả về NULL - không có menu bar
+    cổ điển), nên KHÔNG thể dò command ID qua HMENU/WM_COMMAND như ứng dụng MFC thường.
+    Vì vậy vẫn phải gửi phím tắt, nhưng chỉ gửi khi đã xác nhận chắc chắn cửa sổ chính
+    đang là cửa sổ foreground thật sự (GetForegroundWindow() == hwnd) ngay trước mỗi
+    phím, để không bao giờ gửi phím mù vào cửa sổ khác nếu focus bị đổi bất ngờ.
+    """
+    user32 = ctypes.windll.user32
+
+    def _assert_foreground():
+        if not _window_belongs_to_pid(hwnd, pid) or not user32.IsWindowVisible(hwnd):
+            raise AutomationError(
+                "MAIN_WINDOW_NOT_VISIBLE",
+                f'Cửa sổ chính NB-Designer (PID={pid}) không còn hiển thị trước khi mở Text Library.'
+            )
+        if user32.GetForegroundWindow() != hwnd:
+            raise AutomationError(
+                "MAIN_WINDOW_NOT_FOREGROUND",
+                f'Cửa sổ chính NB-Designer (PID={pid}) không ở foreground, dừng lại để tránh '
+                'gửi phím tắt mù vào cửa sổ khác. Hãy để yên NB-Designer rồi thử lại.'
+            )
+
+    from pywinauto.keyboard import send_keys
+
+    _assert_foreground()
+    send_keys('%o', pause=0.05)
+    time.sleep(0.2)
+    _assert_foreground()
+    send_keys('t', pause=0.05)
+    log('Đã gửi phím tắt Alt+O, T để mở Text Library.')
+
+
 
 
 def _wait_for_dialog(pid, title, timeout=8.0, poll=0.2):
@@ -346,178 +507,204 @@ def import_to_nb_designer(csv_path):
         raise AutomationError("CSV_NOT_FOUND", f"Không tìm thấy file CSV: {abs_path}")
 
     pid, main_win = _connect_main_window()
-    _force_foreground(main_win.handle)
-    time.sleep(0.3)
-
-    # 1. Mở Text Library nếu chưa mở sẵn.
-    text_lib_hwnd = None
-    for hwnd in _enum_visible_windows_for_pid(pid, class_filter="#32770"):
-        buf = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
-        if buf.value == "Text Library":
-            text_lib_hwnd = hwnd
-            break
-
-    if text_lib_hwnd is None:
-        log('Chưa thấy Text Library đang mở, gửi Alt+O -> T để mở...')
-        send_keys('%o')
-        time.sleep(0.3)
-        send_keys('t')
-        text_lib_hwnd = _wait_for_dialog(pid, "Text Library", timeout=8.0)
-        if text_lib_hwnd is None:
+    main_hwnd = main_win.handle
+    result = None
+    try:
+        restored_hwnd = _force_foreground(main_hwnd, pid)
+        if not restored_hwnd:
             raise AutomationError(
-                "TEXT_LIBRARY_NOT_FOUND",
-                'Đã gửi phím mở Text Library (Alt+O -> T) nhưng không thấy dialog "Text Library" '
-                'xuất hiện sau 8 giây. Có thể NB-Designer chưa mở project, đang bận dialog khác, '
-                'hoặc phiên bản này dùng phím tắt khác. Hãy tự mở Text Library thủ công rồi thử lại.'
+                "MAIN_WINDOW_NOT_VISIBLE",
+                f'Không thể khôi phục cửa sổ chính NB-Designer (PID={pid}, HWND={main_hwnd}). '
+                'Hãy đưa NB-Designer lên màn hình rồi thử lại.'
             )
-    else:
-        log('Text Library đã đang mở sẵn, dùng luôn.')
+        main_hwnd = restored_hwnd
+        time.sleep(0.3)
 
-    app = Application(backend="win32").connect(handle=text_lib_hwnd)
-    text_lib = app.window(handle=text_lib_hwnd)
+        # 1. Mở Text Library nếu chưa mở sẵn.
+        text_lib_hwnd = None
+        for hwnd in _enum_visible_windows_for_pid(pid, class_filter="#32770"):
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == "Text Library":
+                text_lib_hwnd = hwnd
+                break
 
-    # 2. Đọc số dòng hiện có trong ListView "List1" trước khi import (để đối chiếu sau).
-    before_count = None
-    try:
-        list1 = text_lib.child_window(class_name="SysListView32")
-        if list1.exists():
-            before_count = list1.item_count()
-    except Exception as e:
-        log(f'Không đọc được số dòng hiện có trong List1 (bỏ qua, không nghiêm trọng): {e}')
+        if text_lib_hwnd is None:
+            if not _force_foreground(main_hwnd, pid):
+                raise AutomationError(
+                    "MAIN_WINDOW_NOT_VISIBLE",
+                    f'Cửa sổ chính NB-Designer (PID={pid}) không còn hiển thị trước khi mở Text Library.'
+                )
+            log('Chưa thấy Text Library đang mở, gửi phím tắt mở Text Library...')
+            _open_text_library_via_keys(main_hwnd, pid)
+            text_lib_hwnd = _wait_for_dialog(pid, "Text Library", timeout=8.0)
+            if text_lib_hwnd is None:
+                raise AutomationError(
+                    "TEXT_LIBRARY_NOT_FOUND",
+                    'Đã gọi menu mở Text Library nhưng không thấy dialog "Text Library" xuất hiện sau 8 giây. '
+                    'Có thể NB-Designer chưa mở project hoặc đang bận dialog khác. Hãy tự mở Text Library '
+                    'thủ công rồi thử lại.'
+                )
+        else:
+            log('Text Library đã đang mở sẵn, dùng luôn.')
 
-    # 3. Tìm và bấm nút "Import".
-    import_btn = text_lib.child_window(title="Import", class_name="Button")
-    if not import_btn.exists():
-        raise AutomationError(
-            "IMPORT_BUTTON_NOT_FOUND",
-            'Đã mở được dialog "Text Library" nhưng không tìm thấy nút "Import" bên trong. '
-            'Có thể phiên bản NB-Designer này đặt tên nút khác. Hãy chạy inspect_textlib.py để dò '
-            'lại tên control chính xác.'
-        )
-    # Dùng click_input() (mô phỏng CLICK CHUỘT THẬT) chứ không dùng click() (chỉ gửi message
-    # BM_CLICK) - đã kiểm chứng trên máy thật: NB-Designer không phản hồi với BM_CLICK khi dialog
-    # không thật sự ở foreground, nút bấm không có phản ứng gì (không mở dialog chọn file).
-    text_lib.set_focus()
-    import_btn.click_input()
-    log('Đã bấm nút Import.')
+        app = Application(backend="win32").connect(handle=text_lib_hwnd)
+        text_lib = app.window(handle=text_lib_hwnd)
 
-    # 4. Chờ dialog chọn file xuất hiện.
-    file_dlg_hwnd = _wait_for_dialog(pid, "Import Project Database", timeout=6.0)
-    if file_dlg_hwnd is None:
-        file_dlg_hwnd = _find_generic_file_dialog(pid, exclude_hwnds={text_lib_hwnd}, timeout=3.0)
-    if file_dlg_hwnd is None:
-        raise AutomationError(
-            "FILE_DIALOG_NOT_FOUND",
-            'Đã bấm Import nhưng không thấy hộp thoại chọn file xuất hiện sau khi chờ. Có thể '
-            'NB-Designer phiên bản này đặt tên dialog khác - hãy chạy inspect_textlib.py để kiểm tra.'
-        )
-
-    file_app = Application(backend="win32").connect(handle=file_dlg_hwnd)
-    file_dlg = file_app.window(handle=file_dlg_hwnd)
-
-    # 5. Điền đường dẫn file vào ô Edit (dùng set_edit_text - ghi thẳng qua WM_SETTEXT, KHÔNG dùng
-    # send_keys nên không lo ký tự đặc biệt trong đường dẫn (dấu ngoặc, dấu +, ...) bị hiểu nhầm
-    # thành phím điều khiển).
-    edit_ctrl = file_dlg.child_window(class_name="Edit")
-    if not edit_ctrl.exists():
-        raise AutomationError(
-            "EDIT_CONTROL_NOT_FOUND",
-            'Tìm thấy hộp thoại chọn file nhưng không thấy ô nhập tên file (Edit) bên trong.'
-        )
-    edit_ctrl.set_edit_text(abs_path)
-    log(f'Đã điền đường dẫn: {abs_path}')
-
-    # 6. Bấm nút "&Open" (hoặc "Open" tuỳ bản Windows/ngôn ngữ).
-    open_btn = file_dlg.child_window(title="&Open", class_name="Button")
-    if not open_btn.exists():
-        open_btn = file_dlg.child_window(best_match="Open", class_name="Button")
-    if not open_btn.exists():
-        raise AutomationError(
-            "OPEN_BUTTON_NOT_FOUND",
-            'Đã điền đường dẫn file nhưng không tìm thấy nút "Open" trong hộp thoại.'
-        )
-    known_hwnds = {text_lib_hwnd, file_dlg_hwnd}
-    file_dlg.set_focus()
-    open_btn.click_input()
-    log('Đã bấm Open.')
-
-    # 7. Chờ hộp thoại chọn file đóng lại (xác nhận Windows đã xử lý việc chọn file).
-    if not _wait_until_gone(file_dlg_hwnd, timeout=8.0):
-        raise AutomationError(
-            "FILE_DIALOG_DID_NOT_CLOSE",
-            'Đã bấm Open nhưng hộp thoại chọn file không đóng lại sau 8 giây. Có thể NB-Designer '
-            'đang báo lỗi (sai định dạng file?) - hãy kiểm tra màn hình NB-Designer.'
-        )
-
-    # 8. NB-Designer có thể hiện thêm message box xác nhận/báo lỗi sau khi import - nếu có, đọc nội
-    # dung và tự bấm OK để không bị treo, đồng thời đưa nội dung đó vào thông báo cuối cùng.
-    extra_dialog_text, extra_dialog_action = _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=2.5)
-    if extra_dialog_text:
-        log(f'NB-Designer hiện thêm thông báo: {extra_dialog_text}')
-
-    # 9. Đối chiếu số dòng trong List1 trước/sau để xác minh import có thực sự thêm dữ liệu không.
-    after_count = None
-    delta = None
-    try:
-        list1 = text_lib.child_window(class_name="SysListView32")
-        end = time.time() + 5.0
-        while time.time() < end:
+        # 2. Đọc số dòng hiện có trong ListView "List1" trước khi import (để đối chiếu sau).
+        before_count = None
+        try:
+            list1 = text_lib.child_window(class_name="SysListView32")
             if list1.exists():
-                after_count = list1.item_count()
-                if before_count is not None and after_count != before_count:
-                    break
-            time.sleep(0.25)
-        if before_count is not None and after_count is not None:
-            delta = after_count - before_count
-    except Exception as e:
-        log(f'Không đối chiếu được số dòng sau import (bỏ qua, không nghiêm trọng): {e}')
+                before_count = list1.item_count()
+        except Exception as e:
+            log(f'Không đọc được số dòng hiện có trong List1 (bỏ qua, không nghiêm trọng): {e}')
 
-    # 10. Bấm OK trên Text Library để đóng dialog, hoàn tất.
-    closed = False
-    try:
-        ok_btn = text_lib.child_window(title="OK", class_name="Button")
-        if ok_btn.exists():
-            text_lib.set_focus()
-            ok_btn.click_input()
-            # timeout=6.0: đã kiểm chứng trên máy thật, sau luồng trùng tên (bấm &Yes ghi đè) NB-Designer
-            # cần xử lý xong việc cập nhật ListView trước khi dialog thực sự đóng, có thể mất hơn 3s.
-            closed = _wait_until_gone(text_lib_hwnd, timeout=6.0)
-    except Exception as e:
-        log(f'Không bấm được OK để đóng Text Library (không nghiêm trọng): {e}')
+        # 3. Tìm và bấm nút "Import".
+        import_btn = text_lib.child_window(title="Import", class_name="Button")
+        if not import_btn.exists():
+            raise AutomationError(
+                "IMPORT_BUTTON_NOT_FOUND",
+                'Đã mở được dialog "Text Library" nhưng không tìm thấy nút "Import" bên trong. '
+                'Có thể phiên bản NB-Designer này đặt tên nút khác. Hãy chạy inspect_textlib.py để dò '
+                'lại tên control chính xác.'
+            )
+        text_lib.set_focus()
+        import_btn.click_input()
+        log('Đã bấm nút Import.')
 
-    if delta is not None and delta > 0:
-        message = f'Đã tự động Import vào NB-Designer thành công! (Thêm {delta} dòng mới trong Text Library)'
-    elif delta == 0 and extra_dialog_action == "YES":
-        message = (
-            'Đã tự động Import vào NB-Designer thành công! Do trùng tên với (các) mục đã có sẵn '
-            'trong Text Library, NB-Designer đã CẬP NHẬT (ghi đè) nội dung mục đó thay vì thêm '
-            'dòng mới - đây là hành vi bình thường khi Import lại dữ liệu đã chỉnh sửa.'
-        )
-    elif delta == 0:
-        message = (
-            'Đã gửi lệnh Import và hộp thoại chọn file đã đóng bình thường, nhưng số dòng trong '
-            'Text Library không đổi. Hãy kiểm tra lại trong NB-Designer xem dữ liệu đã vào chưa '
-            '(có thể do trùng dữ liệu, hoặc do định dạng file).'
-        )
-    else:
-        message = (
-            'Đã gửi lệnh Import và hộp thoại chọn file đã đóng bình thường, nhưng không xác minh '
-            'được số dòng trong Text Library (không nghiêm trọng). Hãy kiểm tra lại trong NB-Designer.'
-        )
-    if extra_dialog_text and extra_dialog_action != "YES":
-        message += f'\nNB-Designer báo thêm: {extra_dialog_text}'
-    if not closed:
-        message += '\n(Lưu ý: dialog Text Library có thể vẫn đang mở, hãy kiểm tra và đóng lại nếu cần.)'
+        # 4. Chờ dialog chọn file xuất hiện.
+        file_dlg_hwnd = _wait_for_dialog(pid, "Import Project Database", timeout=6.0)
+        if file_dlg_hwnd is None:
+            file_dlg_hwnd = _find_generic_file_dialog(pid, exclude_hwnds={text_lib_hwnd}, timeout=3.0)
+        if file_dlg_hwnd is None:
+            raise AutomationError(
+                "FILE_DIALOG_NOT_FOUND",
+                'Đã bấm Import nhưng không thấy hộp thoại chọn file xuất hiện sau khi chờ. Có thể '
+                'NB-Designer phiên bản này đặt tên dialog khác - hãy chạy inspect_textlib.py để kiểm tra.'
+            )
 
-    return {
-        "success": True,
-        "code": "OK",
-        "message": message,
-        "beforeCount": before_count,
-        "afterCount": after_count,
-        "importedDelta": delta,
-    }
+        file_app = Application(backend="win32").connect(handle=file_dlg_hwnd)
+        file_dlg = file_app.window(handle=file_dlg_hwnd)
+
+        # 5. Điền đường dẫn file vào ô Edit.
+        edit_ctrl = file_dlg.child_window(class_name="Edit")
+        if not edit_ctrl.exists():
+            raise AutomationError(
+                "EDIT_CONTROL_NOT_FOUND",
+                'Tìm thấy hộp thoại chọn file nhưng không thấy ô nhập tên file (Edit) bên trong.'
+            )
+        edit_ctrl.set_edit_text(abs_path)
+        log(f'Đã điền đường dẫn: {abs_path}')
+
+        # 6. Bấm nút "&Open" (hoặc "Open" tuỳ bản Windows/ngôn ngữ).
+        open_btn = file_dlg.child_window(title="&Open", class_name="Button")
+        if not open_btn.exists():
+            open_btn = file_dlg.child_window(best_match="Open", class_name="Button")
+        if not open_btn.exists():
+            raise AutomationError(
+                "OPEN_BUTTON_NOT_FOUND",
+                'Đã điền đường dẫn file nhưng không tìm thấy nút "Open" trong hộp thoại.'
+            )
+        known_hwnds = {text_lib_hwnd, file_dlg_hwnd}
+        file_dlg.set_focus()
+        open_btn.click_input()
+        log('Đã bấm Open.')
+
+        # 7. Chờ hộp thoại chọn file đóng lại.
+        if not _wait_until_gone(file_dlg_hwnd, timeout=8.0):
+            raise AutomationError(
+                "FILE_DIALOG_DID_NOT_CLOSE",
+                'Đã bấm Open nhưng hộp thoại chọn file không đóng lại sau 8 giây. Có thể NB-Designer '
+                'đang báo lỗi (sai định dạng file?) - hãy kiểm tra màn hình NB-Designer.'
+            )
+
+        # 8. Đọc và xử lý message box sau import.
+        extra_dialog_text, extra_dialog_action = _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=2.5)
+        if extra_dialog_text:
+            log(f'NB-Designer hiện thêm thông báo: {extra_dialog_text}')
+
+        # 9. Đối chiếu số dòng trong List1 trước/sau.
+        after_count = None
+        delta = None
+        try:
+            list1 = text_lib.child_window(class_name="SysListView32")
+            end = time.time() + 5.0
+            while time.time() < end:
+                if list1.exists():
+                    after_count = list1.item_count()
+                    if before_count is not None and after_count != before_count:
+                        break
+                time.sleep(0.25)
+            if before_count is not None and after_count is not None:
+                delta = after_count - before_count
+        except Exception as e:
+            log(f'Không đối chiếu được số dòng sau import (bỏ qua, không nghiêm trọng): {e}')
+
+        # 10. Bấm OK trên Text Library để đóng dialog.
+        closed = False
+        try:
+            ok_btn = text_lib.child_window(title="OK", class_name="Button")
+            if ok_btn.exists():
+                text_lib.set_focus()
+                ok_btn.click_input()
+                closed = _wait_until_gone(text_lib_hwnd, timeout=6.0)
+        except Exception as e:
+            log(f'Không bấm được OK để đóng Text Library (không nghiêm trọng): {e}')
+
+        if delta is not None and delta > 0:
+            message = f'Đã tự động Import vào NB-Designer thành công! (Thêm {delta} dòng mới trong Text Library)'
+        elif delta == 0 and extra_dialog_action == "YES":
+            message = (
+                'Đã tự động Import vào NB-Designer thành công! Do trùng tên với (các) mục đã có sẵn '
+                'trong Text Library, NB-Designer đã CẬP NHẬT (ghi đè) nội dung mục đó thay vì thêm '
+                'dòng mới - đây là hành vi bình thường khi Import lại dữ liệu đã chỉnh sửa.'
+            )
+        elif delta == 0:
+            message = (
+                'Đã gửi lệnh Import và hộp thoại chọn file đã đóng bình thường, nhưng số dòng trong '
+                'Text Library không đổi. Hãy kiểm tra lại trong NB-Designer xem dữ liệu đã vào chưa '
+                '(có thể do trùng dữ liệu, hoặc do định dạng file).'
+            )
+        else:
+            message = (
+                'Đã gửi lệnh Import và hộp thoại chọn file đã đóng bình thường, nhưng không xác minh '
+                'được số dòng trong Text Library (không nghiêm trọng). Hãy kiểm tra lại trong NB-Designer.'
+            )
+        if extra_dialog_text and extra_dialog_action != "YES":
+            message += f'\nNB-Designer báo thêm: {extra_dialog_text}'
+        if not closed:
+            message += '\n(Lưu ý: dialog Text Library có thể vẫn đang mở, hãy kiểm tra và đóng lại nếu cần.)'
+
+        result = {
+            "success": True,
+            "code": "OK",
+            "message": message,
+            "beforeCount": before_count,
+            "afterCount": after_count,
+            "importedDelta": delta,
+        }
+        return result
+    finally:
+        restored_hwnd = _restore_main_window(pid, main_hwnd)
+        if restored_hwnd is None:
+            log(f'Cảnh báo: không thể khôi phục cửa sổ chính NB-Designer PID={pid}, HWND={main_hwnd}.')
+            if isinstance(result, dict):
+                result["code"] = "MAIN_WINDOW_NOT_VISIBLE"
+                result["success"] = False
+                result["message"] = (
+                    'Import đã chạy nhưng không thể xác nhận/khôi phục cửa sổ chính NB-Designer. '
+                    'Hãy kiểm tra cửa sổ NB-Designer trước khi thao tác tiếp.'
+                )
+            elif sys.exc_info()[0] is None:
+                raise AutomationError(
+                    "MAIN_WINDOW_NOT_VISIBLE",
+                    f'Không thể khôi phục cửa sổ chính NB-Designer (PID={pid}).'
+                )
+            else:
+                log('Giữ nguyên lỗi gốc để không che mất nguyên nhân import.')
+        elif not ctypes.windll.user32.IsWindowVisible(restored_hwnd):
+            log(f'Cảnh báo: HWND={restored_hwnd} vẫn không visible sau khi khôi phục.')
 
 
 if __name__ == '__main__':

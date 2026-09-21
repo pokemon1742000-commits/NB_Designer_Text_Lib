@@ -60,17 +60,23 @@ def _find_pid_by_exe(exe_name):
     return None
 
 
-def _enum_visible_windows_for_pid(pid):
+def _enum_windows_for_pid(pid):
     results = []
 
     def _cb(hwnd, _lparam):
-        if _pid_of_hwnd(hwnd) == pid and ctypes.windll.user32.IsWindowVisible(hwnd):
+        if _pid_of_hwnd(hwnd) == pid:
             length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
             buf = ctypes.create_unicode_buffer(length + 1)
             ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
             cls = ctypes.create_unicode_buffer(256)
             ctypes.windll.user32.GetClassNameW(hwnd, cls, 256)
-            results.append((hwnd, buf.value, cls.value))
+            results.append({
+                "hwnd": hwnd,
+                "title": buf.value,
+                "class_name": cls.value,
+                "visible": bool(ctypes.windll.user32.IsWindowVisible(hwnd)),
+                "minimized": bool(ctypes.windll.user32.IsIconic(hwnd)),
+            })
         return True
 
     ctypes.windll.user32.EnumWindows(_EnumWindowsProc(_cb), 0)
@@ -85,26 +91,51 @@ def main():
         sys.exit(1)
 
     print(f'Đã tìm thấy tiến trình PID={pid}.')
-    windows = _enum_visible_windows_for_pid(pid)
+    windows = _enum_windows_for_pid(pid)
     if not windows:
-        print('Tiến trình đang chạy nhưng không có cửa sổ nào đang hiển thị.')
+        print('Tiến trình đang chạy nhưng không có cửa sổ top-level nào.')
         sys.exit(1)
 
-    print(f'\nCác cửa sổ đang hiển thị của tiến trình này ({len(windows)}):')
-    for hwnd, title, cls in windows:
-        print(f'  - hwnd={hwnd} class={cls!r} title={title!r}')
+    print(f'\nCác cửa sổ top-level của tiến trình này ({len(windows)}):')
+    for item in windows:
+        state = []
+        if item["visible"]:
+            state.append("visible")
+        else:
+            state.append("hidden")
+        if item["minimized"]:
+            state.append("minimized")
+        print(
+            f'  - hwnd={item["hwnd"]} [{", ".join(state)}] '
+            f'class={item["class_name"]!r} title={item["title"]!r}'
+        )
 
-    # Ưu tiên in chi tiết cây control của dialog "Text Library" nếu đang mở, vì đây là mục tiêu
-    # chính cần dò. Nếu không có, in cửa sổ lớn nhất (thường là cửa sổ chính) để tham khảo thêm.
-    text_lib = next((w for w in windows if w[1] == 'Text Library'), None)
+    # Ưu tiên in chi tiết cây control của dialog "Text Library" nếu đang mở.
+    text_lib = next((w for w in windows if w["title"] == 'Text Library' and w["visible"]), None)
     target = text_lib
 
     if target is None:
-        print('\nKhông thấy dialog "Text Library" đang mở. Hãy mở nó lên (Alt+O -> T trong '
-              'NB-Designer) rồi chạy lại script này để dò đúng cây control cần thiết.')
+        main_candidates = [
+            w for w in windows
+            if w["title"].strip() and w["class_name"] != "#32770"
+        ]
+        if main_candidates:
+            target = main_candidates[0]
+            print(
+                '\nKhông thấy dialog "Text Library" đang hiển thị. Cửa sổ có tiêu đề gần nhất '
+                f'là HWND={target["hwnd"]} '
+                f'({"visible" if target["visible"] else "hidden"}'
+                f'{", minimized" if target["minimized"] else ""}).'
+            )
+        else:
+            print('\nKhông thấy cửa sổ chính có tiêu đề để dò control.')
+            sys.exit(1)
+
+    if target["title"] != 'Text Library':
+        print('\nHãy mở dialog "Text Library" rồi chạy lại script để dò cây control chính xác.')
         sys.exit(0)
 
-    hwnd, title, cls = target
+    hwnd, title, cls = target["hwnd"], target["title"], target["class_name"]
     print(f'\n=== CÂY CONTROL CỦA "{title}" (class={cls}) ===')
     try:
         app = Application(backend="win32").connect(handle=hwnd)
