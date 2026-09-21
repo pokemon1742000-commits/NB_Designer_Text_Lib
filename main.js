@@ -165,9 +165,10 @@ ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
 //      nên phải tự ghép byte BOM vào thủ công.
 //   2) 3 dòng đầu ("Text Lib", "Name:", "Status:") có một tab THỪA ở cuối dòng trước khi xuống dòng.
 //      Dòng "Language..." và các dòng dữ liệu (0, 1, 2...) thì KHÔNG có tab thừa này.
-//   3) File mẫu (1 item) không có dòng trống giữa các khối - vì chỉ có sẵn 1 item nên chưa rõ NB-Designer
-//      có yêu cầu dòng trống phân tách giữa nhiều item hay không. Tạm bỏ dòng trống để khớp đúng mẫu;
-//      nếu import nhiều dòng vào NB-Designer bị lỗi/gộp sai, có thể cần thêm lại dòng trống giữa các khối.
+//   3) File mẫu gốc (chỉ có 1 item) không có dòng trống giữa các khối. Khi có từ 2 item trở lên,
+//      theo yêu cầu thực tế, mỗi khối Name được ngăn cách bằng 1 dòng trống (không thêm trước
+//      khối đầu tiên). Nếu NB-Designer báo lỗi import khi có dòng trống này, hãy bỏ đoạn
+//      "if (itemIndex > 0) { lines.push(''); }" bên dưới.
 // Người dùng có thể nhấn Enter trong ô Language để xuống dòng (textarea nhiều dòng). Nhưng file
 // CSV của NB-Designer là định dạng theo DÒNG (mỗi dòng dữ liệu phải nằm trên đúng 1 dòng vật lý),
 // nên nếu ghi thẳng ký tự xuống dòng thật vào sẽ làm lệch toàn bộ cấu trúc các dòng phía sau.
@@ -184,7 +185,12 @@ function createNBTextLibCSV(filePath, rows, langCount) {
   lines.push(['Text Lib', 'V100', ''].join('\t'));
 
   // Duyệt qua từng khối dữ liệu
-  rows.forEach(item => {
+  rows.forEach((item, itemIndex) => {
+    // Thêm 1 dòng trống ngăn cách giữa các khối Name (không thêm trước khối đầu tiên)
+    if (itemIndex > 0) {
+      lines.push('');
+    }
+
     // Dòng Name: | <Tên> | (tab thừa)
     lines.push(['Name:', item.name || '', ''].join('\t'));
 
