@@ -5,6 +5,7 @@
   "scripts": {
     "start": "electron .",
     "build": "electron-builder",
+    "build:publish": "electron-builder --publish always",
     "deploy": "git add -A && git commit -m \"update\" && npm run build && git push",
     "release:auto": "node scripts/release.js"
   },
@@ -18,6 +19,9 @@
   "build": {
     "appId": "com.nbtextlib.exporter",
     "productName": "NB TextLib Exporter",
+    "publish": {
+      "provider": "github"
+    },
     "files": [
       "main.js",
       "renderer.js",
