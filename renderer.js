@@ -28,6 +28,13 @@ document.addEventListener('DOMContentLoaded', () => {
   items.push(makeEmptyItem());
   renderHeader();
   renderTable();
+
+  // Nối các nút điều khiển cửa sổ tự vẽ (titlebar) tới main.js qua IPC
+  document.getElementById('btnMinimize').onclick = () => ipcRenderer.send('window-minimize');
+  document.getElementById('btnMaximize').onclick = () => ipcRenderer.send('window-maximize-toggle');
+  document.getElementById('btnClose').onclick = () => ipcRenderer.send('window-close');
+  // Nút X nhỏ riêng cho chế độ Mini (compact-mode)
+  document.getElementById('btnCloseMini').onclick = () => ipcRenderer.send('window-close');
 });
 
 function makeEmptyItem() {
@@ -263,6 +270,9 @@ function toggleCompact() {
   isCompact = !isCompact;
   document.body.classList.toggle('compact-mode', isCompact);
   ipcRenderer.send('toggle-compact-mode', isCompact);
+
+  const compactBtn = document.getElementById('compactBtn');
+  compactBtn.textContent = isCompact ? '🔍 Phóng to' : '📌 Thu nhỏ Mini';
 }
 
 // ---------- Toolbar: Export CSV ----------

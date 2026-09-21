@@ -43,6 +43,7 @@ function createWindow() {
     height: 750,
     minWidth: 600,
     minHeight: 120,
+    frame: false, // Ẩn khung/tiêu đề gốc của hệ điều hành - tự vẽ titlebar trong index.html
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -50,12 +51,31 @@ function createWindow() {
   });
 
   win.loadFile('index.html');
+
+  // Đồng bộ trạng thái phóng to/khôi phục để renderer đổi icon nút Maximize cho đúng
+  win.on('maximize', () => win.webContents.send('window-state-changed', { maximized: true }));
+  win.on('unmaximize', () => win.webContents.send('window-state-changed', { maximized: false }));
 }
 
 app.whenReady().then(createWindow);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// 0. ĐIỀU KHIỂN CỬA SỔ TỰ VẼ (vì đã tắt frame gốc của hệ điều hành ở createWindow())
+ipcMain.on('window-minimize', () => {
+  if (win) win.minimize();
+});
+
+ipcMain.on('window-maximize-toggle', () => {
+  if (!win) return;
+  if (win.isMaximized()) win.unmaximize();
+  else win.maximize();
+});
+
+ipcMain.on('window-close', () => {
+  if (win) win.close();
 });
 
 // 1. Chế độ Thu nhỏ / Luôn nổi (Compact Mode)

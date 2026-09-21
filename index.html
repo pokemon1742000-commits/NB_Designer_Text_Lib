@@ -5,22 +5,70 @@
   <title>NB-Designer Text Library Exporter</title>
   <style>
     /* --- CẤU HÌNH KÉO DI CHUYỂN CỬA SỔ (DRAG) --- */
-    body { 
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-      padding: 10px; 
-      background-color: #f8f9fa; 
-      margin: 0; 
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+    }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f8f9fa;
       transition: all 0.2s;
-      /* Cho phép giữ chuột và kéo cửa sổ di chuyển khắp màn hình */
-      -webkit-app-region: drag;
+      display: flex;
+      flex-direction: column;
     }
 
     /* Vùng tương tác (nút bấm, ô nhập, bảng) phải loại bỏ drag để gõ chữ và click được */
-    input, button, table, .table-container { 
-      -webkit-app-region: no-drag; 
+    input, button, table, .table-container {
+      -webkit-app-region: no-drag;
     }
 
-    /* --- GIAO DIỆN CHÍNH --- */
+    /* --- THANH TIÊU ĐỀ TỰ VẼ (thay cho titlebar gốc của Windows, đã tắt ở main.js) --- */
+    .titlebar {
+      -webkit-app-region: drag;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 32px;
+      flex: 0 0 auto;
+      background-color: #212529;
+      color: #f8f9fa;
+      padding: 0 0 0 10px;
+      font-size: 13px;
+      user-select: none;
+    }
+    .titlebar-title { display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; }
+    .titlebar-controls { display: flex; -webkit-app-region: no-drag; height: 100%; }
+    .win-btn {
+      width: 42px; height: 32px;
+      border: none; border-radius: 0;
+      background: transparent; color: #f8f9fa;
+      font-size: 13px; line-height: 32px; padding: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .win-btn:hover { background-color: rgba(255,255,255,0.12); opacity: 1; }
+    .win-btn-close:hover { background-color: #e81123; }
+
+    /* Nút đóng riêng cho chế độ Mini - nằm trong .toolbar, mặc định ẩn, chỉ hiện khi compact-mode */
+    .titlebar-close-mini {
+      display: none;
+      width: 22px;
+      height: 22px;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: 4px;
+      background-color: #dc3545;
+      color: #fff;
+      font-size: 11px;
+      line-height: 1;
+      padding: 0;
+      margin-left: auto; /* đẩy sát mép phải toolbar, giống vị trí X cũ */
+    }
+    .titlebar-close-mini:hover { background-color: #b02a37; }
+
+    /* --- NỘI DUNG CHÍNH --- */
+    .content { padding: 10px; overflow: auto; flex: 1 1 auto; }
     h2 { margin-top: 0; color: #343a40; font-size: 18px; margin-bottom: 8px; }
     .toolbar { margin-bottom: 8px; display: flex; gap: 8px; align-items: center; }
     
@@ -35,7 +83,7 @@
     .btn-add { background-color: #0d6efd; color: white; }
     .btn-col { background-color: #0dcaf0; color: #212529; }
     .btn-compact { background-color: #6f42c1; color: white; }
-    .btn-export { background-color: #198754; color: white; margin-left: auto; }
+    .btn-export { background-color: #198754; color: white; }
     .btn-import { background-color: #fd7e14; color: white; }
     button:hover { opacity: 0.9; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -55,11 +103,26 @@
     tr.group-start td { border-top: 2px solid #adb5bd; }
 
     /* --- CHẾ ĐỘ SIÊU THU NHỎ (COMPACT MODE) --- */
-    body.compact-mode { padding: 4px; background-color: #fff; }
+    /* Ẩn hẳn thanh titlebar bình thường (icon, tên phần mềm, nút thu nhỏ/phóng to/đóng gốc) -
+       không còn chừa hàng riêng nào phía trên nữa, tránh khoảng trắng thừa. Nút X được chuyển
+       xuống nằm chung hàng với toolbar (xem .titlebar-close-mini phía trên). */
+    body.compact-mode .titlebar {
+      display: none;
+    }
+    /* Titlebar đang là vùng kéo (drag) duy nhất, nên khi ẩn nó, chuyển vùng kéo sang chính
+       toolbar (trừ các nút bấm bên trong, đã có input/button/table = no-drag ở trên). */
+    body.compact-mode .toolbar {
+      -webkit-app-region: drag;
+    }
+    body.compact-mode .titlebar-close-mini {
+      display: flex;
+    }
+
+    body.compact-mode .content { padding: 4px; background-color: #fff; }
     body.compact-mode h2 { display: none; }
     body.compact-mode .btn-add,
     body.compact-mode .btn-col { display: none; }
-    body.compact-mode .toolbar { margin-bottom: 4px; justify-content: flex-end; }
+    body.compact-mode .toolbar { margin-bottom: 4px; }
     body.compact-mode .btn-import,
     body.compact-mode .btn-export { padding: 2px 8px; font-size: 11px; }
     body.compact-mode .btn-compact { padding: 2px 8px; font-size: 11px; background-color: #fd7e14; }
@@ -68,30 +131,47 @@
 </head>
 <body>
 
-  <h2>Quản Lý Nhập Liệu Text Library</h2>
-  
-  <div class="toolbar">
-    <button class="btn-add" onclick="addRow()">+ Thêm dòng</button>
-    <button class="btn-col" onclick="addLanguageColumn()">+ Thêm ngôn ngữ</button>
-    <button class="btn-compact" id="compactBtn" onclick="toggleCompact()">📌 Thu nhỏ Mini</button>
-    <button class="btn-import" id="importBtn" onclick="importToNB()">⚡ Import vào NB-Designer</button>
-    <button class="btn-export" onclick="exportExcel()">Export (.csv)</button>
+  <!-- Thanh tiêu đề tự vẽ (thay cho titlebar gốc Windows, đã tắt frame ở main.js) -->
+  <div class="titlebar" id="titlebar">
+    <div class="titlebar-title">
+      <span>⚙️</span>
+      <span>NB-Designer Text Library Exporter</span>
+    </div>
+    <div class="titlebar-controls">
+      <button class="win-btn" id="btnMinimize" title="Thu nhỏ">─</button>
+      <button class="win-btn" id="btnMaximize" title="Phóng to/Khôi phục">☐</button>
+      <button class="win-btn win-btn-close" id="btnClose" title="Đóng">✕</button>
+    </div>
   </div>
 
-  <div class="table-container">
-    <table id="dataTable">
-      <thead>
-        <tr id="headerRow">
-          <th style="width: 35px;">STT</th>
-          <th>Name</th>
-          <th style="width: 65px;">Status</th>
-          <th>Language1</th>
-          <th>Language2</th>
-          <th style="width: 45px;">Xóa</th>
-        </tr>
-      </thead>
-      <tbody id="tableBody"></tbody>
-    </table>
+  <div class="content">
+    <h2>Quản Lý Nhập Liệu Text Library</h2>
+
+    <div class="toolbar">
+      <button class="btn-add" onclick="addRow()">+ Thêm dòng</button>
+      <button class="btn-col" onclick="addLanguageColumn()">+ Thêm ngôn ngữ</button>
+      <button class="btn-compact" id="compactBtn" onclick="toggleCompact()">📌 Thu nhỏ Mini</button>
+      <button class="btn-import" id="importBtn" onclick="importToNB()">⚡ Import vào NB-Designer</button>
+      <button class="btn-export" onclick="exportExcel()">Export (.csv)</button>
+      <!-- Nút X nhỏ, chỉ hiện khi ở chế độ Mini (compact-mode), nằm chung hàng với toolbar -->
+      <button class="titlebar-close-mini" id="btnCloseMini" title="Đóng">✕</button>
+    </div>
+
+    <div class="table-container">
+      <table id="dataTable">
+        <thead>
+          <tr id="headerRow">
+            <th style="width: 35px;">STT</th>
+            <th>Name</th>
+            <th style="width: 65px;">Status</th>
+            <th>Language1</th>
+            <th>Language2</th>
+            <th style="width: 45px;">Xóa</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
   </div>
 
   <script src="renderer.js"></script>
