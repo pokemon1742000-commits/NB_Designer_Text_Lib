@@ -459,18 +459,34 @@ def _find_generic_file_dialog(pid, exclude_hwnds, timeout=6.0, poll=0.2):
 
 
 def _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=2.5, poll=0.2):
-    """Sau khi bấm Open, NB-Designer có thể hiện thêm message box. Đã kiểm chứng trên máy thật 2
-    dạng: (1) thông báo xong việc, chỉ có nút "OK"; (2) hỏi xác nhận khi TRÙNG TÊN với mục đã có
-    sẵn trong Text Library - "The same item exists in text library. Do you replace it?" (nút
-    "&Yes"/"&No"). Với dạng (2), chủ động bấm "&Yes" (ghi đè) thay vì bấm đại nút đầu tiên tìm
-    thấy: mục đích chính của app là chỉnh sửa bản dịch rồi Import lại để CẬP NHẬT dữ liệu đã có,
-    nếu lỡ bấm "&No" thì mọi chỉnh sửa sau lần import đầu sẽ không bao giờ được áp dụng.
-    Trả về (text tĩnh đọc được, hành động đã bấm: "OK"|"YES"|"OTHER"|None)."""
+    """Sau khi bấm Open, NB-Designer có thể hiện thêm message box - ĐÃ KIỂM CHỨNG trên máy thật là
+    có thể hiện LIÊN TIẾP NHIỀU dialog (ví dụ: cảnh báo "số ngôn ngữ trong file khác project" rồi
+    NGAY SAU ĐÓ mới tới hỏi xác nhận trùng tên), không phải luôn luôn chỉ 1 dialog. Vì vậy hàm này
+    lặp tới khi hết `timeout`, xử lý MỌI dialog phụ mới xuất hiện, không dừng lại sau dialog đầu
+    tiên - bỏ sót dialog thứ 2 trở đi sẽ khiến Text Library kẹt không đóng được, và dialog kẹt đó
+    còn có thể làm lần chạy import KẾ TIẾP không bấm được nút Import (mất focus vào dialog cũ).
+
+    Đã kiểm chứng trên máy thật 2 dạng nội dung: (1) thông báo xong việc, chỉ có nút "OK"; (2) hỏi
+    xác nhận khi TRÙNG TÊN với mục đã có sẵn trong Text Library - "The same item exists in text
+    library. Do you replace it?" (nút "&Yes"/"&No"). Với dạng (2), chủ động bấm "&Yes" (ghi đè)
+    thay vì bấm đại nút đầu tiên tìm thấy: mục đích chính của app là chỉnh sửa bản dịch rồi Import
+    lại để CẬP NHẬT dữ liệu đã có, nếu lỡ bấm "&No" thì mọi chỉnh sửa sau lần import đầu sẽ không
+    bao giờ được áp dụng.
+
+    Trả về (text tĩnh của tất cả dialog đã gặp nối lại, hành động tổng hợp: "YES" nếu có ít nhất 1
+    dialog bấm "&Yes", ngược lại là hành động cuối cùng bấm được "OK"|"OTHER"|None)."""
+    handled_hwnds = set()
+    all_texts = []
+    saw_yes = False
+    other_action = None
     end = time.time() + timeout
     while time.time() < end:
+        found_new = False
         for hwnd in _enum_visible_windows_for_pid(pid, class_filter="#32770"):
-            if hwnd in known_hwnds:
+            if hwnd in known_hwnds or hwnd in handled_hwnds:
                 continue
+            found_new = True
+            handled_hwnds.add(hwnd)
             text_parts = []
             action = None
             try:
@@ -496,9 +512,18 @@ def _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=2.5, poll=0.2):
                         action = "OTHER"
             except Exception:
                 pass
-            return " ".join(text_parts), action
-        time.sleep(poll)
-    return "", None
+            if text_parts:
+                all_texts.append(" ".join(text_parts))
+            if action == "YES":
+                saw_yes = True
+            elif action:
+                other_action = action
+            # Chờ UI ổn định trước khi dò tiếp - dialog kế tiếp (nếu có) thường xuất hiện ngay
+            # sau khi dialog trước vừa được bấm nút, chưa kịp render lúc EnumWindows chạy lại.
+            time.sleep(0.15)
+        if not found_new:
+            time.sleep(poll)
+    return " ".join(all_texts), ("YES" if saw_yes else other_action)
 
 
 def import_to_nb_designer(csv_path):
@@ -620,7 +645,7 @@ def import_to_nb_designer(csv_path):
             )
 
         # 8. Đọc và xử lý message box sau import.
-        extra_dialog_text, extra_dialog_action = _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=2.5)
+        extra_dialog_text, extra_dialog_action = _dismiss_unexpected_dialogs(pid, known_hwnds, timeout=4.0)
         if extra_dialog_text:
             log(f'NB-Designer hiện thêm thông báo: {extra_dialog_text}')
 
@@ -703,8 +728,8 @@ def import_to_nb_designer(csv_path):
                 )
             else:
                 log('Giữ nguyên lỗi gốc để không che mất nguyên nhân import.')
-        elif not ctypes.windll.user32.IsWindowVisible(restored_hwnd):
-            log(f'Cảnh báo: HWND={restored_hwnd} vẫn không visible sau khi khôi phục.')
+        # Không cần kiểm tra lại IsWindowVisible ở đây: _restore_main_window() chỉ trả về hwnd
+        # khác None khi đã tự xác nhận "visible và không minimize" ngay trước khi return.
 
 
 if __name__ == '__main__':

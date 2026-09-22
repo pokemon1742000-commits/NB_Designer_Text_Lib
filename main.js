@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { exec, spawn } = require('child_process');
+const { createNBTextLibCSV, parseNBTextLibCSV } = require('./csv_textlib.js');
 
 let win;
 let cachedPythonCmd = null;
@@ -243,71 +244,22 @@ ipcMain.on('import-to-nb', async (event, { rows, langCount }) => {
   }
 });
 
-// --- HÀM TẠO FILE CSV CHIA CỘT TAB-SEPARATED (UTF-16LE + BOM) ĐÚNG CHUẨN FILE MẪU NB-DESIGNER ---
-// Đã đối chiếu byte-by-byte với file mẫu TextLib.csv do NB-Designer xuất ra. Lưu ý các điểm khác
-// với bản gốc trước đây:
-//   1) File mẫu có BOM UTF-16LE (FF FE) ở đầu file - fs.writeFileSync(..., 'utf16le') KHÔNG tự thêm BOM,
-//      nên phải tự ghép byte BOM vào thủ công.
-//   2) 3 dòng đầu ("Text Lib", "Name:", "Status:") có một tab THỪA ở cuối dòng trước khi xuống dòng.
-//      Dòng "Language..." và các dòng dữ liệu (0, 1, 2...) thì KHÔNG có tab thừa này.
-//   3) File mẫu gốc (chỉ có 1 item) không có dòng trống giữa các khối. Khi có từ 2 item trở lên,
-//      theo yêu cầu thực tế, mỗi khối Name được ngăn cách bằng 1 dòng trống (không thêm trước
-//      khối đầu tiên). Nếu NB-Designer báo lỗi import khi có dòng trống này, hãy bỏ đoạn
-//      "if (itemIndex > 0) { lines.push(''); }" bên dưới.
-// Người dùng có thể nhấn Enter trong ô Language để xuống dòng (textarea nhiều dòng). Nhưng file
-// CSV của NB-Designer là định dạng theo DÒNG (mỗi dòng dữ liệu phải nằm trên đúng 1 dòng vật lý),
-// nên nếu ghi thẳng ký tự xuống dòng thật vào sẽ làm lệch toàn bộ cấu trúc các dòng phía sau.
-// => Đổi ký tự xuống dòng thật thành chuỗi 2 ký tự "\n" (giữ ý định xuống dòng của người dùng
-// dưới dạng văn bản thường, không làm hỏng cấu trúc file).
-function escapeMultilineForCSV(str) {
-  return String(str || '').replace(/\r\n|\r|\n/g, '\\n');
-}
+// 4. NẠP NGƯỢC 1 FILE CSV TEXT LIBRARY CÓ SẴN VÀO BẢNG NHẬP LIỆU (chỉnh sửa tiếp thay vì gõ lại
+// từ đầu). Hàm đọc/phân tích cú pháp CSV nằm ở csv_textlib.js (xem chú thích ở đó để biết chi
+// tiết định dạng và lý do tách riêng khỏi main.js).
+ipcMain.on('open-csv-for-table', async (event) => {
+  try {
+    const { filePaths } = await dialog.showOpenDialog(win, {
+      title: 'Chọn file CSV Text Library để nạp vào bảng',
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }],
+      properties: ['openFile'],
+    });
+    if (!filePaths || filePaths.length === 0) return; // Người dùng bấm Hủy (Cancel)
 
-function createNBTextLibCSV(filePath, rows, langCount) {
-  let lines = [];
-
-  // Dòng 1: Text Lib | V100 | (tab thừa)
-  lines.push(['Text Lib', 'V100', ''].join('\t'));
-
-  // Duyệt qua từng khối dữ liệu
-  rows.forEach((item, itemIndex) => {
-    // Thêm 1 dòng trống ngăn cách giữa các khối Name (không thêm trước khối đầu tiên)
-    if (itemIndex > 0) {
-      lines.push('');
-    }
-
-    // Dòng Name: | <Tên> | (tab thừa)
-    lines.push(['Name:', item.name || '', ''].join('\t'));
-
-    // Dòng Status: | <Số trạng thái> | (tab thừa)
-    const statusNum = parseInt(item.status) || 1;
-    lines.push(['Status:', statusNum, ''].join('\t'));
-
-    // Dòng Header Language: Language | Language1 | Language2 ... (không có tab thừa)
-    let langHeader = ['Language'];
-    for (let l = 1; l <= langCount; l++) {
-      langHeader.push(`Language${l}`);
-    }
-    lines.push(langHeader.join('\t'));
-
-    // Các dòng dữ liệu trạng thái: Index (0, 1...) | Text Lang1 | Text Lang2 ...
-    // Mỗi dòng trạng thái lấy đúng bộ ngôn ngữ riêng người dùng đã nhập ở dòng con tương ứng
-    // trên giao diện (item.states[s]), không còn lặp lại 1 bộ chung cho mọi dòng.
-    for (let s = 0; s < statusNum; s++) {
-      const stateData = (item.states && item.states[s]) || {};
-      let rowData = [s];
-      for (let l = 1; l <= langCount; l++) {
-        rowData.push(escapeMultilineForCSV(stateData[`lang${l}`]));
-      }
-      lines.push(rowData.join('\t'));
-    }
-  });
-
-  // Ghép các dòng bằng CRLF, có CRLF ở cuối dòng cuối cùng (giống hệt file mẫu)
-  const content = lines.join('\r\n') + '\r\n';
-
-  // Ghi BOM (FF FE) + nội dung UTF-16LE
-  const bom = Buffer.from([0xff, 0xfe]);
-  const body = Buffer.from(content, 'utf16le');
-  fs.writeFileSync(filePath, Buffer.concat([bom, body]));
-}
+    const data = parseNBTextLibCSV(filePaths[0]);
+    event.reply('csv-loaded-into-table', data);
+  } catch (err) {
+    console.error('Lỗi đọc CSV để nạp vào bảng:', err);
+    event.reply('csv-load-error', 'Lỗi khi đọc file CSV: ' + err.message);
+  }
+});

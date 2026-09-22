@@ -70,7 +70,7 @@
     /* --- NỘI DUNG CHÍNH --- */
     .content { padding: 10px; overflow: auto; flex: 1 1 auto; }
     h2 { margin-top: 0; color: #343a40; font-size: 18px; margin-bottom: 8px; }
-    .toolbar { margin-bottom: 8px; display: flex; gap: 8px; align-items: center; }
+    .toolbar { margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     
     button { 
       padding: 5px 12px; 
@@ -85,10 +85,28 @@
     .btn-compact { background-color: #6f42c1; color: white; }
     .btn-export { background-color: #198754; color: white; }
     .btn-import { background-color: #fd7e14; color: white; }
+    .btn-csvload { background-color: #20c997; color: white; }
     button:hover { opacity: 0.9; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
-    
-    .table-container { 
+
+    .dirty-dot { color: #dc3545; font-size: 16px; margin-left: 4px; vertical-align: middle; }
+
+    .search-box { padding: 4px 8px; border: 1px solid #ced4da; border-radius: 4px; font-size: 13px; width: 220px; }
+    .search-count { font-size: 12px; color: #6c757d; white-space: nowrap; }
+
+    .validation-banner {
+      background: #fff3cd;
+      color: #664d03;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      margin-bottom: 8px;
+      border: 1px solid #ffe69c;
+    }
+
+    input.input-error { border-color: #dc3545 !important; background-color: #fff5f5; }
+
+    .table-container {
       overflow-x: auto; 
       background: white; 
       border-radius: 6px; 
@@ -121,7 +139,11 @@
     body.compact-mode .content { padding: 4px; background-color: #fff; }
     body.compact-mode h2 { display: none; }
     body.compact-mode .btn-add,
-    body.compact-mode .btn-col { display: none; }
+    body.compact-mode .btn-col,
+    body.compact-mode .btn-csvload,
+    body.compact-mode .search-box,
+    body.compact-mode .search-count,
+    body.compact-mode .validation-banner { display: none; }
     body.compact-mode .toolbar { margin-bottom: 4px; }
     body.compact-mode .btn-import,
     body.compact-mode .btn-export { padding: 2px 8px; font-size: 11px; }
@@ -145,17 +167,22 @@
   </div>
 
   <div class="content">
-    <h2>Quản Lý Nhập Liệu Text Library</h2>
+    <h2>Quản Lý Nhập Liệu Text Library<span class="dirty-dot" id="dirtyIndicator" style="display:none;" title="Có thay đổi chưa Export/Import">●</span></h2>
 
     <div class="toolbar">
       <button class="btn-add" onclick="addRow()">+ Thêm dòng</button>
       <button class="btn-col" onclick="addLanguageColumn()">+ Thêm ngôn ngữ</button>
+      <button class="btn-csvload" id="csvLoadBtn" onclick="importCsvToTable()">📥 Nhập từ CSV</button>
+      <input type="text" id="searchBox" class="search-box" placeholder="🔍 Tìm theo tên hoặc nội dung..." oninput="onSearchInput()">
+      <span class="search-count" id="searchCount"></span>
       <button class="btn-compact" id="compactBtn" onclick="toggleCompact()">📌 Thu nhỏ Mini</button>
       <button class="btn-import" id="importBtn" onclick="importToNB()">⚡ Import vào NB-Designer</button>
       <button class="btn-export" onclick="exportExcel()">Export (.csv)</button>
       <!-- Nút X nhỏ, chỉ hiện khi ở chế độ Mini (compact-mode), nằm chung hàng với toolbar -->
       <button class="titlebar-close-mini" id="btnCloseMini" title="Đóng">✕</button>
     </div>
+
+    <div class="validation-banner" id="validationBanner" style="display:none;"></div>
 
     <div class="table-container">
       <table id="dataTable">
